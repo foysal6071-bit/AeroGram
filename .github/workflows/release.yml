@@ -24,13 +24,6 @@ jobs:
           test -n "$PATCH" || { echo "::error::scripts/patch_telegram.py paoa jay nai"; exit 1; }
           echo "PATCH_SCRIPT=$PATCH" >> "$GITHUB_ENV"
 
-      - name: Check secrets
-        env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-        run: |
-          [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ] || { echo "::error::Repo secrets TG_API_ID ও TG_API_HASH din (my.telegram.org)"; exit 1; }
-
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
@@ -39,12 +32,25 @@ jobs:
       - name: Clone Telegram Android source
         run: git clone --depth 1 --recursive --shallow-submodules https://github.com/DrKLO/Telegram.git Telegram
 
+      # Secret na dile Telegram source-er default APP_ID/APP_HASH babohar hobe
+      - name: Resolve credentials
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          B=Telegram/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          ID="$TG_API_ID"; HASH="$TG_API_HASH"
+          [ -n "$ID" ] || ID="$(grep -oP 'APP_ID\s*=\s*\K\d+' "$B" | head -1)"
+          [ -n "$HASH" ] || HASH="$(grep -oP 'APP_HASH\s*=\s*"\K[^"]*' "$B" | head -1)"
+          echo "RESOLVED_APP_ID=$ID" >> "$GITHUB_ENV"
+          echo "RESOLVED_APP_HASH=$HASH" >> "$GITHUB_ENV"
+
       # video variant = audio call + video call dui-i thake
       - name: Patch (rebrand + credentials)
         env:
           VARIANT: video
-          APP_ID: ${{ secrets.TG_API_ID }}
-          APP_HASH: ${{ secrets.TG_API_HASH }}
+          APP_ID: ${{ env.RESOLVED_APP_ID }}
+          APP_HASH: ${{ env.RESOLVED_APP_HASH }}
           APP_NAME: AeroGram
         run: python3 "$PATCH_SCRIPT"
 
