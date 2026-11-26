@@ -3,16 +3,6 @@ name: AeroGram Auto Build & Release
 
 on:
   workflow_dispatch:
-    inputs:
-      variant:
-        description: Build version
-        required: true
-        type: choice
-        default: both
-        options:
-          - both
-          - audio
-          - video
   push:
     branches:
       - main
@@ -22,14 +12,17 @@ permissions:
 
 jobs:
   build:
+    name: Build AeroGram Audio + Video
     runs-on: ubuntu-24.04
     timeout-minutes: 300
 
     steps:
+      # 1. Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Extract ZIP Project
+      # 2. Extract ZIP
+      - name: Extract AeroGram ZIP
         run: |
           set -e
 
@@ -48,23 +41,29 @@ jobs:
           mkdir -p scripts
           cp "$PATCHER" scripts/patch_telegram.py
 
-          echo "Project extracted successfully"
+          echo "ZIP extracted successfully"
 
+      # 3. Free disk space
       - name: Free Disk Space
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL || true
+
           df -h /
 
+      # 4. Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
+      # 5. Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install SDK and NDK
+      # 6. Install SDK and NDK
+      - name: Install Android SDK and NDK
         run: |
           yes | sdkmanager --licenses
 
@@ -74,142 +73,148 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
-      - name: Prepare Signing Key
+      # 7. Clone Telegram Source
+      - name: Clone Telegram Android
+        run: |
+          git clone --depth 1 --recursive \
+            --shallow-submodules \
+            https://github.com/DrKLO/Telegram.git Telegram
+
+      # 8. Patch AeroGram
+      - name: Apply AeroGram Patch
+        env:
+          VARIANT: video
+          APP_ID: ${{ secrets.TG_API_ID }}
+          APP_HASH: ${{ secrets.TG_API_HASH }}
+          APP_NAME: AeroGram
+          SRC: Telegram
+        run: |
+          set -e
+
+          python3 scripts/patch_telegram.py
+
+          echo "Audio and Video call patch applied"
+
+      # 9. Google Services (Optional)
+      - name: Setup Google Services
+        env:
+          GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GS" ]; then
+            echo "$GS" > Telegram/TMessagesProj_AppStandalone/google-services.json
+            echo "Google services configured"
+          else
+            echo "Google services skipped"
+          fi
+
+      # 10. Prepare Signing Key
+      - name: Prepare APK Signing Key
         env:
           KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
-          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
-          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_PASS_SECRET: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS_SECRET: ${{ secrets.KEY_ALIAS }}
         run: |
           set -e
 
           if [ -n "$KS_B64" ]; then
+
+            test -n "$KS_PASS_SECRET"
+            test -n "$KS_ALIAS_SECRET"
+
             echo "$KS_B64" | base64 -d > release.jks
 
-            test -n "$KS_PASS"
-            test -n "$KS_ALIAS"
+            echo "SIGN_PASS=$KS_PASS_SECRET" >> "$GITHUB_ENV"
+            echo "SIGN_ALIAS=$KS_ALIAS_SECRET" >> "$GITHUB_ENV"
 
             echo "Using saved signing key"
+
           else
-            PASS=$(openssl rand -hex 20)
+
+            PASS=$(openssl rand -hex 24)
 
             keytool -genkeypair \
               -keystore release.jks \
               -storepass "$PASS" \
               -keypass "$PASS" \
-              -alias aero \
+              -alias aerogram \
               -keyalg RSA \
               -keysize 2048 \
               -validity 10000 \
               -dname "CN=AeroGram"
 
-            echo "KS_PASS=$PASS" >> "$GITHUB_ENV"
-            echo "KS_ALIAS=aero" >> "$GITHUB_ENV"
+            echo "SIGN_PASS=$PASS" >> "$GITHUB_ENV"
+            echo "SIGN_ALIAS=aerogram" >> "$GITHUB_ENV"
 
-            echo "Temporary signing key created"
+            echo "New signing key generated"
+
           fi
 
-      - name: Build AeroGram
-        env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
-          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
-          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
-          VARIANT: ${{ inputs.variant }}
+      # 11. Build APK
+      - name: Build Universal APK
+        working-directory: Telegram
         run: |
           set -e
 
-          VARIANT="${VARIANT:-both}"
+          chmod +x gradlew
 
-          if [ "$VARIANT" = "both" ]; then
-            VARIANTS="audio video"
-          else
-            VARIANTS="$VARIANT"
-          fi
+          ./gradlew \
+            --no-daemon \
+            --max-workers=2 \
+            :TMessagesProj_AppStandalone:assembleAfatStandalone
 
-          mkdir -p release
+      # 12. Find APK
+      - name: Prepare APK
+        run: |
+          set -e
 
-          for V in $VARIANTS; do
+          APK=$(find Telegram/TMessagesProj_AppStandalone/build/outputs/apk \
+            -type f -name '*.apk' | head -1)
 
-            echo "================================"
-            echo "Building AeroGram: $V"
-            echo "================================"
+          test -n "$APK"
 
-            rm -rf Telegram
+          cp "$APK" AeroGram-unsigned.apk
 
-            git clone --depth 1 --recursive \
-              --shallow-submodules \
-              https://github.com/DrKLO/Telegram.git Telegram
+          echo "APK prepared"
 
-            export VARIANT="$V"
-            export APP_ID="$TG_API_ID"
-            export APP_HASH="$TG_API_HASH"
-            export APP_NAME="AeroGram"
-            export SRC="Telegram"
+      # 13. Optimize and Sign
+      - name: Zipalign and Sign APK
+        env:
+          SIGN_PASS: ${{ env.SIGN_PASS }}
+          SIGN_ALIAS: ${{ env.SIGN_ALIAS }}
+        run: |
+          set -e
 
-            python3 scripts/patch_telegram.py
+          BT="$ANDROID_HOME/build-tools/36.0.0"
 
-            if [ -n "$GOOGLE_SERVICES_JSON" ]; then
-              echo "$GOOGLE_SERVICES_JSON" \
-                > Telegram/TMessagesProj_AppStandalone/google-services.json
-            fi
+          "$BT/zipalign" -f -p 4 \
+            AeroGram-unsigned.apk \
+            AeroGram-aligned.apk
 
-            cd Telegram
+          "$BT/apksigner" sign \
+            --ks release.jks \
+            --ks-pass env:SIGN_PASS \
+            --ks-key-alias "$SIGN_ALIAS" \
+            --key-pass env:SIGN_PASS \
+            --out AeroGram.apk \
+            AeroGram-aligned.apk
 
-            chmod +x gradlew
+          "$BT/zipalign" -c -p 4 AeroGram.apk
+          "$BT/apksigner" verify --verbose AeroGram.apk
 
-            ./gradlew --no-daemon --max-workers=2 \
-              :TMessagesProj_AppStandalone:assembleAfatStandalone
+          rm -f AeroGram-unsigned.apk AeroGram-aligned.apk
 
-            cd ..
+          ls -lh AeroGram.apk
 
-            APK=$(find Telegram/TMessagesProj_AppStandalone/build/outputs/apk \
-              -type f -name '*.apk' | head -1)
-
-            test -n "$APK"
-
-            BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
-
-            "$BUILD_TOOLS/zipalign" -f -p 4 \
-              "$APK" "release/AeroGram-$V-aligned.apk"
-
-            if [ -n "$KS_B64" ]; then
-              PASS="$KS_PASS"
-              ALIAS="$KS_ALIAS"
-            else
-              PASS="$KS_PASS"
-              ALIAS="$KS_ALIAS"
-            fi
-
-            "$BUILD_TOOLS/apksigner" sign \
-              --ks release.jks \
-              --ks-pass env:PASS \
-              --ks-key-alias "$ALIAS" \
-              --key-pass env:PASS \
-              --out "release/AeroGram-$V.apk" \
-              "release/AeroGram-$V-aligned.apk"
-
-            "$BUILD_TOOLS/apksigner" verify \
-              "release/AeroGram-$V.apk"
-
-            rm "release/AeroGram-$V-aligned.apk"
-
-            echo "AeroGram $V build completed"
-
-            rm -rf Telegram
-
-          done
-
-          echo "All APK builds completed"
-
-      - name: Upload APK Artifacts
+      # 14. Upload Artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AeroGram-APKs
-          path: release/*.apk
+          name: AeroGram-Android
+          path: AeroGram.apk
           if-no-files-found: error
           retention-days: 30
 
+      # 15. GitHub Release
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -218,20 +223,23 @@ jobs:
           body: |
             # AeroGram Android
 
+            Single universal APK.
+
+            Features:
+            - Private Chat
+            - Audio Calling
+            - Video Calling
+            - Universal APK
+
             Unofficial Telegram-based Android client.
-
-            Included builds:
-            - Audio Call Edition
-            - Video Call Edition
-
-            APKs are signed and zipaligned.
-          files: release/*.apk
+          files: AeroGram.apk
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # 16. Summary
       - name: Build Summary
         if: always()
         run: |
-          echo "AeroGram workflow completed."
-          ls -lh release/ || true
+          echo "AeroGram build finished."
+          ls -lh AeroGram.apk || true
