@@ -15,15 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Repo-te zip upload kora thakle nije unzip hobe
-      - name: Unzip uploaded zip (if any)
-        run: |
-          shopt -s nullglob
-          for z in *.zip; do echo "Unzipping $z"; unzip -o -q "$z"; done
-          PATCH="$(find . -name patch_telegram.py -not -path './Telegram/*' -print -quit)"
-          test -n "$PATCH" || { echo "::error::scripts/patch_telegram.py paoa jay nai"; exit 1; }
-          echo "PATCH_SCRIPT=$PATCH" >> "$GITHUB_ENV"
-
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
@@ -32,27 +23,74 @@ jobs:
       - name: Clone Telegram Android source
         run: git clone --depth 1 --recursive --shallow-submodules https://github.com/DrKLO/Telegram.git Telegram
 
-      # Secret na dile Telegram source-er default APP_ID/APP_HASH babohar hobe
-      - name: Resolve credentials
-        env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-        run: |
-          B=Telegram/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
-          ID="$TG_API_ID"; HASH="$TG_API_HASH"
-          [ -n "$ID" ] || ID="$(grep -oP 'APP_ID\s*=\s*\K\d+' "$B" | head -1)"
-          [ -n "$HASH" ] || HASH="$(grep -oP 'APP_HASH\s*=\s*"\K[^"]*' "$B" | head -1)"
-          echo "RESOLVED_APP_ID=$ID" >> "$GITHUB_ENV"
-          echo "RESOLVED_APP_HASH=$HASH" >> "$GITHUB_ENV"
-
-      # video variant = audio call + video call dui-i thake
+      # Patch script ekhane-i embedded (zip/scripts lagbe na).
+      # Kono pattern na mille build fail hoy na, shudhu WARN dekhay.
       - name: Patch (rebrand + credentials)
         env:
-          VARIANT: video
-          APP_ID: ${{ env.RESOLVED_APP_ID }}
-          APP_HASH: ${{ env.RESOLVED_APP_HASH }}
+          APP_ID: ${{ secrets.TG_API_ID }}
+          APP_HASH: ${{ secrets.TG_API_HASH }}
           APP_NAME: AeroGram
-        run: python3 "$PATCH_SCRIPT"
+          APP_PKG: org.aerogram.video
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          SRC = pathlib.Path("Telegram")
+          APP_ID = os.environ.get("APP_ID", "").strip()
+          APP_HASH = os.environ.get("APP_HASH", "").strip()
+          APP_NAME = os.environ.get("APP_NAME", "AeroGram")
+          APP_PKG = os.environ.get("APP_PKG", "org.aerogram.video")
+
+          def read(p):
+              return p.read_text(encoding="utf-8", errors="ignore")
+
+          def patch(files, pattern, repl, label):
+              total = 0
+              for p in files:
+                  t = read(p)
+                  t2, n = re.subn(pattern, repl, t)
+                  if n:
+                      p.write_text(t2, encoding="utf-8")
+                      total += n
+                      print(f"ok   {label}: {p} ({n})")
+              if total == 0:
+                  print(f"WARN {label}: kono pattern mile nai (skip)")
+              return total
+
+          # 1) applicationId (alada package, original Telegram-er sathe conflict hobe na)
+          gradles = [p for p in SRC.rglob("build.gradle*")
+                     if p.parts[1].startswith("TMessagesProj") and "build" not in p.parts[2:-1]]
+          n = patch(gradles, r'applicationId(\s*=?\s*)(["\'])[^"\']+\2',
+                    lambda m: f'applicationId{m.group(1)}{m.group(2)}{APP_PKG}{m.group(2)}',
+                    "applicationId")
+          if n == 0:
+              for g in gradles:
+                  for i, line in enumerate(read(g).splitlines(), 1):
+                      if "applicationId" in line:
+                          print(f"DEBUG {g}:{i}: {line.strip()}")
+
+          # 2) API credentials (secret na dile default thakbe)
+          bv = list(SRC.rglob("BuildVars.java"))
+          if APP_ID.isdigit():
+              patch(bv, r'(APP_ID\s*=\s*)\d+(\s*;)', lambda m: f'{m.group(1)}{APP_ID}{m.group(2)}', "APP_ID")
+          else:
+              print("skip APP_ID: secret deya hoy nai, default thakbe")
+          if APP_HASH:
+              patch(bv, r'(APP_HASH\s*=\s*")[^"]*(")', lambda m: f'{m.group(1)}{APP_HASH}{m.group(2)}', "APP_HASH")
+          else:
+              print("skip APP_HASH: secret deya hoy nai, default thakbe")
+
+          # 3) App name
+          xmls = [p for p in SRC.rglob("*.xml")
+                  if p.parts[1].startswith("TMessagesProj")
+                  and "res" in p.parts and p.parent.name == "values" and p.name.startswith("strings")]
+          patch(xmls, r'(<string\s+name="AppName"[^>]*>)[^<]*(</string>)',
+                lambda m: f'{m.group(1)}{APP_NAME}{m.group(2)}', "AppName")
+          print("PATCH DONE (video: audio call + video call)")
+          PY
+
+      - name: Show patch diff summary
+        run: git -C Telegram diff --stat || true
 
       - name: Optional google-services.json (push notification)
         env:
