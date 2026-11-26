@@ -1,0 +1,213 @@
+
+name: AeroGram Auto Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Build version
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - audio
+          - video
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP Project
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip
+
+          test -f AeroGram-Calls-Fork.zip || {
+            echo "ZIP file missing from repository root"
+            exit 1
+          }
+
+          mkdir extracted
+          unzip -q AeroGram-Calls-Fork.zip -d extracted
+
+          PATCHER=$(find extracted -name patch_telegram.py | head -1)
+          test -n "$PATCHER"
+
+          mkdir -p scripts
+          cp "$PATCHER" scripts/patch_telegram.py
+
+          echo "ZIP extracted successfully"
+
+      - name: Check Secrets
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          test -n "$TG_API_ID"
+          test -n "$TG_API_HASH"
+          test -n "$KS_B64"
+          test -n "$KS_PASS"
+          test -n "$KS_ALIAS"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and NDK
+        run: |
+          yes | sdkmanager --licenses || true
+
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc || true
+          df -h /
+
+      - name: Build AeroGram
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -e
+
+          VARIANT="${VARIANT:-both}"
+
+          if [ "$VARIANT" = "both" ]; then
+            VARIANTS="audio video"
+          else
+            VARIANTS="$VARIANT"
+          fi
+
+          for V in $VARIANTS; do
+
+            echo "Building AeroGram $V"
+
+            git clone --depth 1 --recursive \
+              https://github.com/DrKLO/Telegram.git Telegram
+
+            export VARIANT="$V"
+            export APP_ID="$TG_API_ID"
+            export APP_HASH="$TG_API_HASH"
+            export APP_NAME="AeroGram"
+            export SRC="Telegram"
+
+            python3 scripts/patch_telegram.py
+
+            if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+              echo "$GOOGLE_SERVICES_JSON" \
+                > Telegram/TMessagesProj_AppStandalone/google-services.json
+            fi
+
+            cd Telegram
+
+            chmod +x gradlew
+
+            ./gradlew --no-daemon --max-workers=2 \
+              :TMessagesProj_AppStandalone:assembleAfatStandalone
+
+            cd ..
+
+            APK=$(find Telegram/TMessagesProj_AppStandalone/build/outputs/apk \
+              -type f -name '*.apk' | head -1)
+
+            test -n "$APK"
+
+            cp "$APK" "AeroGram-$V-unsigned.apk"
+
+            rm -rf Telegram
+
+          done
+
+      - name: Sign and Optimize APK
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -e
+
+          echo "$KS_B64" | base64 -d > release.jks
+
+          VARIANT="${VARIANT:-both}"
+
+          if [ "$VARIANT" = "both" ]; then
+            VARIANTS="audio video"
+          else
+            VARIANTS="$VARIANT"
+          fi
+
+          for V in $VARIANTS; do
+
+            APK="AeroGram-$V-unsigned.apk"
+
+            BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+
+            "$BUILD_TOOLS/zipalign" -f -p 4 \
+              "$APK" "AeroGram-$V-aligned.apk"
+
+            "$BUILD_TOOLS/apksigner" sign \
+              --ks release.jks \
+              --ks-pass env:KS_PASS \
+              --ks-key-alias "$KS_ALIAS" \
+              --key-pass env:KS_PASS \
+              --out "AeroGram-$V.apk" \
+              "AeroGram-$V-aligned.apk"
+
+            "$BUILD_TOOLS/apksigner" verify \
+              "AeroGram-$V.apk"
+
+            rm -f "$APK" "AeroGram-$V-aligned.apk"
+
+          done
+
+          ls -lh AeroGram-*.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aerogram-${{ github.run_number }}
+          name: AeroGram Release #${{ github.run_number }}
+          body: |
+            AeroGram Android Release
+
+            - Audio Call Edition
+            - Video Call Edition
+
+            Unofficial third-party Telegram-based client.
+            Source modifications are included in this repository.
+          files: AeroGram-*.apk
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "AeroGram build workflow finished."
