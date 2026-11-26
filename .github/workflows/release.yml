@@ -1,0 +1,78 @@
+name: AeroGram Release
+on:
+  push:
+    paths: ["*.zip"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: |
+          Z=$(ls *.zip | head -n1)
+          mkdir src && unzip -q "$Z" -d src
+          SPEC=$(find src -name buildozer.spec | head -n1)
+          echo "PROJ=$(dirname $SPEC)" >> $GITHUB_ENV
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip autoconf automake libtool libffi-dev libssl-dev
+          pip install buildozer cython==0.29.36
+
+      - name: Keystore
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > $HOME/release.keystore
+            echo "P4A_RELEASE_KEYSTORE_PASSWD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "P4A_RELEASE_KEYALIAS_PASSWD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "P4A_RELEASE_KEYALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+          else
+            keytool -genkey -v -keystore $HOME/release.keystore -alias aerogram \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass aerogram123 -keypass aerogram123 -dname "CN=AeroGram"
+            echo "P4A_RELEASE_KEYSTORE_PASSWD=aerogram123" >> $GITHUB_ENV
+            echo "P4A_RELEASE_KEYALIAS_PASSWD=aerogram123" >> $GITHUB_ENV
+            echo "P4A_RELEASE_KEYALIAS=aerogram" >> $GITHUB_ENV
+          fi
+          echo "P4A_RELEASE_KEYSTORE=$HOME/release.keystore" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: bz-${{ hashFiles('src/**/buildozer.spec') }}
+
+      - name: Optimize spec and build release
+        working-directory: ${{ env.PROJ }}
+        run: |
+          sed -i 's/^android.archs.*/android.archs = arm64-v8a/' buildozer.spec
+          grep -q release_artifact buildozer.spec || sed -i '/^\[app\]/a android.release_artifact = apk' buildozer.spec
+          find . -name "__pycache__" -type d -prune -exec rm -rf {} +
+          buildozer -v android release
+          ls bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AeroGram-release
+          path: ${{ env.PROJ }}/bin/*.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: AeroGram v${{ github.run_number }}
+          files: ${{ env.PROJ }}/bin/*.apk
